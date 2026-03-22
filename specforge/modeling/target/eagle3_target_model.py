@@ -10,7 +10,6 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
-    init_mm_embedding_cache,
 )
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -276,7 +275,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         if not self.is_vlm:
             return
 
-        init_mm_embedding_cache(1024 * 1024 * 512)
+        # init_mm_embedding_cache(1024 * 1024 * 512)
         # Model type (e.g., "qwen2_5_vl", "qwen2_vl")
         self.model_type = getattr(self.hf_config, "model_type", None)
 

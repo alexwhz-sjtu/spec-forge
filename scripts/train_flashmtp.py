@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # coding=utf-8
-"""DFlash Training Script."""
+"""FlashMTP Training Script."""
 
 import argparse
 import logging
@@ -21,15 +21,12 @@ from tqdm import tqdm
 from transformers import AutoConfig, AutoTokenizer
 
 from datasets import load_dataset
-from specforge.args import SGLangBackendArgs, TrackerArgs
-from specforge.core.dflash import OnlineDFlashModel
+from specforge.args import TrackerArgs
+from specforge.core.flashmtp import OnlineFlashMTPModel
 from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
-from specforge.modeling.draft.dflash import DFlashDraftModel
-from specforge.modeling.target.dflash_target_model import (
-    DFlashTargetModel,
-    get_dflash_target_model,
-)
+from specforge.modeling.draft.flashmtp import FlashMTPDraftModel
+from specforge.modeling.target import get_flashmtp_target_model
 from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker
@@ -37,25 +34,27 @@ from specforge.utils import get_last_checkpoint, print_on_rank0, print_with_rank
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train DFlash Draft Model")
+    parser = argparse.ArgumentParser(description="Train FlashMTP Draft Model")
 
     model_group = parser.add_argument_group("model")
     model_group.add_argument("--target-model-path", type=str, required=True)
-    model_group.add_argument(
-        "--target-model-backend",
-        type=str,
-        default="hf",
-        choices=["sglang", "hf"],
-        help="Backend for target model: 'sglang' (service) or 'hf' (local)",
-    )
     model_group.add_argument("--draft-config-path", type=str, default=None)
     model_group.add_argument("--block-size", type=int, default=16)
-    model_group.add_argument("--num-draft-layers", type=int, default=1)
+    model_group.add_argument("--num-draft-layers", type=int, default=5)
     model_group.add_argument(
-        "--mask-token-id",
-        type=int,
-        default=None,
-        help="MASK token ID. If not provided, auto-detect from tokenizer.",
+        "--draft-hidden-size", type=int, default=None,
+        help="Draft model hidden size. If not provided, uses target model's hidden size."
+    )
+    model_group.add_argument(
+        "--draft-intermediate-size", type=int, default=None,
+        help="Draft model intermediate size. If not provided, uses target model's intermediate size."
+    )
+    model_group.add_argument(
+        "--concat-mode",
+        type=str,
+        default="seq",
+        choices=["seq", "feature"],
+        help="Concatenation mode for target hidden states.",
     )
     model_group.add_argument(
         "--attention-backend",
@@ -73,13 +72,6 @@ def parse_args():
         default=512,
         help="Number of anchor positions per sequence",
     )
-    model_group.add_argument(
-        "--loss-decay-gamma",
-        type=float,
-        default=None,
-        help="Gamma for exponential loss decay weighting (paper Eq.4). "
-        "Suggested: 7 for block_size=16, 5 for 10, 4 for 8. None disables.",
-    )
 
     dataset_group = parser.add_argument_group("dataset")
     dataset_group.add_argument("--train-data-path", type=str, required=True)
@@ -95,7 +87,7 @@ def parse_args():
 
     training_group = parser.add_argument_group("training")
     training_group.add_argument("--num-epochs", type=int, default=6)
-    training_group.add_argument("--batch-size", type=int, default=1)
+    training_group.add_argument("--batch-size", type=int, default=8)
     training_group.add_argument("--learning-rate", type=float, default=6e-4)
     training_group.add_argument("--max-length", type=int, default=3072)
     training_group.add_argument("--warmup-ratio", type=float, default=0.04)
@@ -113,7 +105,7 @@ def parse_args():
     output_group = parser.add_argument_group("output")
     output_group.add_argument("--output-dir", type=str, required=True)
     output_group.add_argument("--cache-dir", type=str, default="./cache/train")
-    output_group.add_argument("--log-interval", type=int, default=50)
+    output_group.add_argument("--log-interval", type=int, default=500)
     output_group.add_argument("--eval-interval", type=int, default=1000)
     output_group.add_argument("--save-interval", type=int, default=1000)
 
@@ -128,34 +120,39 @@ def parse_args():
     tracker_group = parser.add_argument_group("tracker")
     TrackerArgs.add_args(tracker_group)
 
+    target_group = parser.add_argument_group("target_model")
+    target_group.add_argument(
+        "--target-model-backend",
+        type=str,
+        default="hf",
+        choices=["hf"],
+        help="Backend for target model (only 'hf' supported for online mode)",
+    )
+    target_group.add_argument(
+        "--offline-mode",
+        action="store_true",
+        help="Use offline mode with pre-computed hidden states (default: online mode)",
+    )
+    target_group.add_argument(
+        "--model-download-dir",
+        type=str,
+        default=None,
+        help="Directory to download target model to",
+    )
+
     dist_group = parser.add_argument_group("distributed")
     dist_group.add_argument("--dist-timeout", type=int, default=30)
-
-    # SGLang specific args
-    sglang_group = parser.add_argument_group("sglang backend")
-    SGLangBackendArgs.add_args(sglang_group)
 
     return parser.parse_args()
 
 
-def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
-    """Build target model (backend wrapper) and draft model."""
+def build_models(args) -> Tuple[FlashMTPDraftModel, AutoTokenizer]:
+    """Build target model components and draft model."""
     print_on_rank0(
-        f"Loading target model from {args.target_model_path} using {args.target_model_backend} backend"
+        f"Loading target model from {args.target_model_path}"
     )
 
-    target_model_kwargs = {}
-    if args.target_model_backend == "sglang":
-        target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
-
-    target_model = get_dflash_target_model(
-        pretrained_model_name_or_path=args.target_model_path,
-        backend=args.target_model_backend,
-        torch_dtype=torch.bfloat16,
-        device="cuda" if args.target_model_backend == "hf" else None,
-        trust_remote_code=args.trust_remote_code,
-        **target_model_kwargs,
-    )
+    tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
 
     if args.draft_config_path:
         draft_config = AutoConfig.from_pretrained(args.draft_config_path)
@@ -166,28 +163,37 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
         draft_config.num_hidden_layers = args.num_draft_layers
         draft_config.block_size = args.block_size
         draft_config.num_target_layers = target_config.num_hidden_layers
+
+        if args.draft_hidden_size is not None:
+            draft_config.hidden_size = args.draft_hidden_size
+        if args.draft_intermediate_size is not None:
+            draft_config.intermediate_size = args.draft_intermediate_size
+
         print_on_rank0("Auto-generated draft config from target model")
 
     if not hasattr(draft_config, "dflash_config") or draft_config.dflash_config is None:
         draft_config.dflash_config = {}
 
+    draft_config.dflash_config["mask_token_id"] = tokenizer.pad_token_id
+    draft_config.dflash_config["target_layer_ids"] = list(range(draft_config.num_target_layers))
+    draft_config.dflash_config["concat_mode"] = args.concat_mode
+
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
 
-    draft_model = DFlashDraftModel(draft_config).cuda().to(torch.bfloat16)
-
-    target_model.set_capture_layers(draft_model.target_layer_ids)
+    draft_model = FlashMTPDraftModel(draft_config).cuda().to(torch.bfloat16)
 
     print_on_rank0(
         f"Draft config: block_size={draft_config.block_size}, "
         f"num_hidden_layers={draft_config.num_hidden_layers}, "
-        f"num_target_layers={draft_config.num_target_layers}"
+        f"num_target_layers={draft_config.num_target_layers}, "
+        f"hidden_size={draft_config.hidden_size}"
     )
     print_on_rank0(
         f"Draft model parameters: {sum(p.numel() for p in draft_model.parameters()):,}"
     )
 
-    return target_model, draft_model
+    return draft_model, tokenizer
 
 
 def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]:
@@ -252,15 +258,15 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
     return train_dataloader, eval_dataloader
 
 
-def save_checkpoint(args, epoch, step, dflash_model, draft_model, optimizer):
+def save_checkpoint(args, epoch, step, flashmtp_model, draft_model, optimizer):
     """Save checkpoint."""
     save_dir = os.path.join(args.output_dir, f"epoch_{epoch}_step_{step}")
     if dist.get_rank() == 0:
         os.makedirs(save_dir, exist_ok=True)
     dist.barrier()
 
-    with FSDP.state_dict_type(dflash_model, StateDictType.FULL_STATE_DICT):
-        state_dict = dflash_model.state_dict()
+    with FSDP.state_dict_type(flashmtp_model, StateDictType.FULL_STATE_DICT):
+        state_dict = flashmtp_model.state_dict()
         draft_state_dict = {
             k.replace("draft_model.", ""): v
             for k, v in state_dict.items()
@@ -286,9 +292,9 @@ def save_checkpoint(args, epoch, step, dflash_model, draft_model, optimizer):
                 "specforge",
                 "modeling",
                 "draft",
-                "dflash.py",
+                "flashmtp.py",
             )
-            modeling_dst = os.path.join(save_dir, "dflash.py")
+            modeling_dst = os.path.join(save_dir, "flashmtp.py")
             if os.path.exists(modeling_src):
                 shutil.copy(modeling_src, modeling_dst)
 
@@ -341,7 +347,7 @@ def main():
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
     print_with_rank("Initialized distributed")
 
-    target_model, draft_model = build_models(args)
+    draft_model, tokenizer = build_models(args)
 
     draft_model_last_checkpoint = None
     if args.ckpt_dir is not None:
@@ -361,7 +367,7 @@ def main():
 
     resume_state = None
     if draft_model_last_checkpoint:
-        loaded_model = DFlashDraftModel.from_pretrained(
+        loaded_model = FlashMTPDraftModel.from_pretrained(
             draft_model_last_checkpoint, torch_dtype=torch.bfloat16
         )
         draft_model.load_state_dict(loaded_model.state_dict())
@@ -380,20 +386,7 @@ def main():
                 f"step {resume_state['global_step']}"
             )
 
-    tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
-
-    if args.mask_token_id is not None:
-        mask_token_id = args.mask_token_id
-    elif tokenizer.mask_token_id is not None:
-        mask_token_id = tokenizer.mask_token_id
-    else:
-        tokenizer.add_special_tokens({"mask_token": "<|MASK|>"})
-        mask_token_id = tokenizer.mask_token_id
-    print_on_rank0(f"Using mask_token_id: {mask_token_id}")
-
-    draft_model.mask_token_id = mask_token_id
-    draft_model.config.dflash_config["mask_token_id"] = mask_token_id
-    draft_model.config.dflash_config["target_layer_ids"] = draft_model.target_layer_ids
+    print_on_rank0(f"Using mask_token_id (pad_token_id): {tokenizer.pad_token_id}")
     print_on_rank0(f"dflash_config: {draft_model.config.dflash_config}")
 
     train_dataloader, eval_dataloader = build_dataloader(args, tokenizer)
@@ -405,25 +398,38 @@ def main():
     print_on_rank0("Loading target embeddings and head...")
     target_components = TargetEmbeddingsAndHead.from_pretrained(
         args.target_model_path,
-        embed_key="model.embed_tokens.weight",  # Adjust if Qwen/Llama differs
+        embed_key="model.embed_tokens.weight",
         lm_head_key="lm_head.weight",
         device="cuda",
         trust_remote_code=args.trust_remote_code,
     )
 
-    dflash_model = OnlineDFlashModel(
+    # Load target model for online hidden states generation if not in offline mode
+    target_model = None
+    if not args.offline_mode:
+        print_on_rank0("Loading target model for online hidden states generation...")
+        target_model = get_flashmtp_target_model(
+            pretrained_model_name_or_path=args.target_model_path,
+            backend=args.target_model_backend,
+            torch_dtype=torch.bfloat16,
+            device="cuda",
+            cache_dir=args.model_download_dir,
+            trust_remote_code=args.trust_remote_code,
+        )
+        print_on_rank0("Target model loaded for online mode")
+
+    flashmtp_model = OnlineFlashMTPModel(
         draft_model=draft_model,
         target_lm_head=target_components.lm_head,
         target_embed_tokens=target_components.embed_tokens,
+        mask_token_id=tokenizer.pad_token_id,
         block_size=draft_model.block_size,
-        mask_token_id=mask_token_id,
-        attention_backend=args.attention_backend,
         num_anchors=args.num_anchors,
-        loss_decay_gamma=args.loss_decay_gamma,
+        concat_mode=args.concat_mode,
     )
 
-    dflash_model = FSDP(
-        dflash_model,
+    flashmtp_model = FSDP(
+        flashmtp_model,
         use_orig_params=True,
         mixed_precision=MixedPrecision(
             param_dtype=torch.bfloat16,
@@ -441,8 +447,8 @@ def main():
         total_steps=total_steps,
     )
 
-    start_epoch = ckpt_info[0]
-    global_step = ckpt_info[1]
+    start_epoch = ckpt_info[0] if 'ckpt_info' in dir() else 0
+    global_step = ckpt_info[1] if 'ckpt_info' in dir() else 0
     if resume_state is not None:
         optimizer.scheduler.load_state_dict(resume_state["scheduler_state_dict"])
         start_epoch = resume_state["epoch"]
@@ -478,12 +484,28 @@ def main():
             input_ids = data["input_ids"].cuda()
             attention_mask = data["attention_mask"].cuda()
             loss_mask = data["loss_mask"].cuda()
-            target_output = target_model.generate_dflash_data(
-                input_ids, attention_mask, loss_mask
-            )
-            hidden_states = target_output.hidden_states.cuda()  # Ensure on GPU
 
-            loss, accuracy = dflash_model(
+            # Get target hidden states
+            if args.offline_mode:
+                # Offline mode: use pre-computed hidden states from dataset
+                if "target_hidden" not in data:
+                    print_on_rank0("Warning: target_hidden not in data, skipping batch (offline mode)")
+                    continue
+                hidden_states = data["target_hidden"].cuda()
+            else:
+                # Online mode: compute hidden states on-the-fly
+                if target_model is None:
+                    print_on_rank0("Error: target_model not loaded for online mode")
+                    continue
+                with torch.no_grad():
+                    flashmtp_output = target_model.generate_hidden_states(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        loss_mask=loss_mask,
+                    )
+                    hidden_states = flashmtp_output.hidden_states
+
+            loss, accuracy = flashmtp_model(
                 input_ids=input_ids,
                 hidden_states=hidden_states,
                 loss_mask=loss_mask,
@@ -526,11 +548,11 @@ def main():
 
             if global_step % args.save_interval == 0:
                 save_checkpoint(
-                    args, epoch, global_step, dflash_model, draft_model, optimizer
+                    args, epoch, global_step, flashmtp_model, draft_model, optimizer
                 )
 
     save_checkpoint(
-        args, args.num_epochs, global_step, dflash_model, draft_model, optimizer
+        args, args.num_epochs, global_step, flashmtp_model, draft_model, optimizer
     )
 
     tracker.close()
